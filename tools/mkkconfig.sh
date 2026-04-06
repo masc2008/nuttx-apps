@@ -25,6 +25,7 @@
 USAGE="USAGE: mkkconfig.sh [-d] [-h] [-m <menu>] [-o <kconfig-file>]"
 KCONFIG=Kconfig
 unset MENU
+TOPDIR=`cd "$(dirname "$0")/.." && pwd -P`
 
 while [ ! -z "$1" ]; do
   case $1 in
@@ -74,7 +75,8 @@ if [ ! -z "${MENU}" ]; then
 fi
 
 for FILE in ${KCONFIG_LIST}; do
-  echo "source \"${FILE}\"" >> ${KCONFIG}
+  RELFILE=${FILE#${TOPDIR}/}
+  echo "source \"\$APPSDIR/${RELFILE}\"" >> ${KCONFIG}
 done
 
 if [ ! -z "${MENU}" ]; then

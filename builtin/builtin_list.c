@@ -31,7 +31,7 @@
 
 #include <sys/stat.h>
 
-#include "builtin_proto.h"
+#include <builtin_proto.h>
 
 /****************************************************************************
  * Private Types
@@ -47,7 +47,7 @@
 
 const struct builtin_s g_builtins[] =
 {
-#  include "builtin_list.h"
+#  include <builtin_list.h>
 #ifdef CONFIG_SCHED_USER_IDENTITY
   { NULL, 0, 0, 0, 0, 0, 0 }
 #else

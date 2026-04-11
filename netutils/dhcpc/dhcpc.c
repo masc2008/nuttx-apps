@@ -91,6 +91,7 @@
 #define DHCP_OPTION_ROUTER      3
 #define DHCP_OPTION_DNS_SERVER  6
 #define DHCP_OPTION_HOST_NAME   12
+#define DHCP_OPTION_NTP_SERVER  42
 #define DHCP_OPTION_REQ_IPADDR  50
 #define DHCP_OPTION_LEASE_TIME  51
 #define DHCP_OPTION_MSG_TYPE    53
@@ -210,10 +211,11 @@ static FAR uint8_t *dhcpc_addclientid(FAR uint8_t *clientid,
 static FAR uint8_t *dhcpc_addreqoptions(FAR uint8_t *optptr)
 {
   *optptr++ = DHCP_OPTION_REQ_LIST;
-  *optptr++ = 3;
+  *optptr++ = 4;
   *optptr++ = DHCP_OPTION_SUBNET_MASK;
   *optptr++ = DHCP_OPTION_ROUTER;
   *optptr++ = DHCP_OPTION_DNS_SERVER;
+  *optptr++ = DHCP_OPTION_NTP_SERVER;
   return optptr;
 }
 
@@ -411,6 +413,39 @@ static uint8_t dhcpc_parseoptions(FAR struct dhcpc_state *presult,
               }
             break;
 
+          case DHCP_OPTION_NTP_SERVER:
+
+            /* Get the NTP server addresses in network order.
+             * DHCP option 42 can contain multiple IPv4 addresses,
+             * each 4 bytes long.
+             */
+
+            if (optptr + 2 <= end)
+              {
+                uint8_t optlen = *(optptr + 1);
+                uint8_t num_ntp = optlen / 4;
+                uint8_t i;
+
+                if (num_ntp > CONFIG_NETUTILS_DHCPC_NTP_SERVER_NUM)
+                  {
+                    num_ntp = CONFIG_NETUTILS_DHCPC_NTP_SERVER_NUM;
+                  }
+
+                presult->num_ntpaddr = 0;
+                for (i = 0; i < num_ntp && (optptr + 2 + i * 4 + 4) <= end;
+                     i++)
+                  {
+                    memcpy(&presult->ntpaddr[i].s_addr, optptr + 2 + i * 4,
+                           4);
+                    presult->num_ntpaddr++;
+                  }
+              }
+            else
+              {
+                nerr("Packet too short (NTP address missing)\n");
+              }
+            break;
+
           case DHCP_OPTION_MSG_TYPE:
 
             /* Get message type */
@@ -509,15 +544,26 @@ static uint8_t dhcpc_parseoptions(FAR struct dhcpc_state *presult,
 static uint8_t dhcpc_parsemsg(FAR struct dhcpc_state_s *pdhcpc, int buflen,
                               FAR struct dhcpc_state *presult)
 {
+  uint8_t type;
+
   if (buflen >= 44 && pdhcpc->packet.op == DHCP_REPLY &&
       memcmp(pdhcpc->packet.xid, pdhcpc->xid, 4) == 0 &&
       memcmp(pdhcpc->packet.chaddr,
              pdhcpc->macaddr, pdhcpc->maclen) == 0)
     {
       memcpy(&presult->ipaddr.s_addr, pdhcpc->packet.yiaddr, 4);
-      return dhcpc_parseoptions(presult, &pdhcpc->packet.options[4],
+      type = dhcpc_parseoptions(presult, &pdhcpc->packet.options[4],
                                 buflen -
                                 (offsetof(struct dhcp_msg, options) + 4));
+      ninfo("DHCP rx if=%s type=%u yiaddr=%08" PRIx32
+            " server=%08" PRIx32 " router=%08" PRIx32
+            " dns=%u ntp=%u\n",
+            pdhcpc->interface, type,
+            (uint32_t)ntohl(presult->ipaddr.s_addr),
+            (uint32_t)ntohl(presult->serverid.s_addr),
+            (uint32_t)ntohl(presult->default_router.s_addr),
+            presult->num_dnsaddr, presult->num_ntpaddr);
+      return type;
     }
 
   return 0;
@@ -590,7 +636,8 @@ FAR void *dhcpc_open(FAR const char *interface, FAR const void *macaddr,
   struct timeval tv;
   int ret;
 
-  ninfo("MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+  ninfo("DHCPC open if=%s MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+        interface,
         ((uint8_t *)macaddr)[0], ((uint8_t *)macaddr)[1],
         ((uint8_t *)macaddr)[2], ((uint8_t *)macaddr)[3],
         ((uint8_t *)macaddr)[4], ((uint8_t *)macaddr)[5]);
@@ -779,6 +826,8 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
 
   oldaddr.s_addr = 0;
   netlib_get_ipv4addr(pdhcpc->interface, &oldaddr);
+  ninfo("DHCPC request if=%s oldaddr=%08" PRIx32 "\n",
+        pdhcpc->interface, (uint32_t)ntohl(oldaddr.s_addr));
 
   /* Loop sending the DISCOVER up to CONFIG_NETUTILS_DHCPC_RETRIES
    * times
@@ -803,9 +852,13 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
 
       /* Send the DISCOVER command */
 
-      ninfo("Broadcast DISCOVER\n");
+      ninfo("DHCPDISCOVER if=%s attempt=%d xid=%02x%02x%02x%02x\n",
+            pdhcpc->interface, retries + 1,
+            pdhcpc->xid[0], pdhcpc->xid[1], pdhcpc->xid[2], pdhcpc->xid[3]);
       if (dhcpc_sendmsg(pdhcpc, presult, DHCPDISCOVER) < 0)
         {
+          nerr("ERROR: failed to send DHCPDISCOVER if=%s errno=%d\n",
+               pdhcpc->interface, errno);
           return ERROR;
         }
 
@@ -827,8 +880,11 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
                    * clobbered by a new OFFER.
                    */
 
-                  ninfo("Received OFFER from %08" PRIx32 "\n",
-                        (uint32_t)ntohl(presult->serverid.s_addr));
+                  ninfo("DHCPOFFER if=%s server=%08" PRIx32
+                        " ip=%08" PRIx32 "\n",
+                        pdhcpc->interface,
+                        (uint32_t)ntohl(presult->serverid.s_addr),
+                        (uint32_t)ntohl(presult->ipaddr.s_addr));
                   pdhcpc->ipaddr.s_addr   = presult->ipaddr.s_addr;
                   pdhcpc->serverid.s_addr = presult->serverid.s_addr;
 
@@ -851,6 +907,8 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
             {
               /* An error other than a timeout was received -- error out */
 
+              nerr("ERROR: recv DHCPOFFER failed if=%s errno=%d\n",
+                   pdhcpc->interface, errno);
               return ERROR;
             }
         }
@@ -864,6 +922,8 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
 
   if (state == STATE_INITIAL)
     {
+      nerr("ERROR: no DHCPOFFER received if=%s retries=%d\n",
+           pdhcpc->interface, retries);
       return ERROR;
     }
 
@@ -884,9 +944,15 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
        * us.
        */
 
-      ninfo("Send REQUEST\n");
+      ninfo("DHCPREQUEST if=%s server=%08" PRIx32 " reqip=%08" PRIx32
+            "\n",
+            pdhcpc->interface,
+            (uint32_t)ntohl(pdhcpc->serverid.s_addr),
+            (uint32_t)ntohl(pdhcpc->ipaddr.s_addr));
       if (dhcpc_sendmsg(pdhcpc, presult, DHCPREQUEST) < 0)
         {
+          nerr("ERROR: failed to send DHCPREQUEST if=%s errno=%d\n",
+               pdhcpc->interface, errno);
           return ERROR;
         }
 
@@ -911,7 +977,7 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
 
               if (msgtype == DHCPACK)
                 {
-                  ninfo("Received ACK\n");
+                  ninfo("DHCPACK if=%s\n", pdhcpc->interface);
                   state = STATE_HAVE_LEASE;
                 }
 
@@ -919,7 +985,7 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
 
               else if (msgtype == DHCPNAK)
                 {
-                  ninfo("Received NAK\n");
+                  ninfo("DHCPNAK if=%s\n", pdhcpc->interface);
                   oldaddr.s_addr = INADDR_ANY;
                   netlib_set_ipv4addr(pdhcpc->interface, &oldaddr);
                   errno = ECONNREFUSED;
@@ -934,7 +1000,8 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
               else if (msgtype == DHCPOFFER &&
                        pdhcpc->serverid.s_addr != presult->serverid.s_addr)
                 {
-                  ninfo("Received another OFFER, send DECLINE\n");
+                  ninfo("DHCPOFFER from another server if=%s, sending "
+                        "DHCPDECLINE\n", pdhcpc->interface);
                   dhcpc_sendmsg(pdhcpc, presult, DHCPDECLINE);
                 }
 
@@ -942,7 +1009,8 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
 
               else
                 {
-                  ninfo("Ignoring msgtype=%d\n", msgtype);
+                  ninfo("Ignoring msgtype=%d if=%s\n", msgtype,
+                        pdhcpc->interface);
                 }
             }
 
@@ -956,6 +1024,8 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
             {
               /* An error other than a timeout was received */
 
+              nerr("ERROR: recv DHCPACK failed if=%s errno=%d\n",
+                   pdhcpc->interface, errno);
               netlib_set_ipv4addr(pdhcpc->interface, &oldaddr);
               return ERROR;
             }
@@ -970,6 +1040,8 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
 
   if (state != STATE_HAVE_LEASE)
     {
+      nerr("ERROR: no DHCPACK received if=%s retries=%d\n",
+           pdhcpc->interface, retries);
       return ERROR;
     }
 
@@ -996,6 +1068,19 @@ int dhcpc_request(FAR void *handle, FAR struct dhcpc_state *presult)
                 ip4_addr2(presult->dnsaddr[i].s_addr),
                 ip4_addr3(presult->dnsaddr[i].s_addr),
                 ip4_addr4(presult->dnsaddr[i].s_addr));
+        }
+    }
+
+  if (presult->num_ntpaddr > 0)
+    {
+      uint8_t i;
+      for (i = 0; i < presult->num_ntpaddr; i++)
+        {
+          ninfo("Got NTP server %d: %u.%u.%u.%u\n", i,
+                ip4_addr1(presult->ntpaddr[i].s_addr),
+                ip4_addr2(presult->ntpaddr[i].s_addr),
+                ip4_addr3(presult->ntpaddr[i].s_addr),
+                ip4_addr4(presult->ntpaddr[i].s_addr));
         }
     }
 

@@ -667,7 +667,10 @@ static void netinit_net_bringup(void)
 #ifdef CONFIG_NETUTILS_NTPCLIENT
   /* Start the NTP client */
 
-  ntpc_start();
+  if (!g_use_dhcpc)
+    {
+      ntpc_start();
+    }
 #endif
 }
 #else

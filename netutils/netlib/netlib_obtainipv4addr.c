@@ -25,10 +25,18 @@
  ****************************************************************************/
 
 #include <debug.h>
+#include <arpa/inet.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/types.h>
 
 #include "netutils/dhcpc.h"
 #include "netutils/netlib.h"
+
+#ifdef CONFIG_NETUTILS_NTPCLIENT
+#  include "netutils/ntpclient.h"
+#endif
 
 /****************************************************************************
  * Private Functions
@@ -105,6 +113,60 @@ static int dhcp_setup_result(FAR const char *ifname,
   return OK;
 }
 
+#ifdef CONFIG_NETUTILS_NTPCLIENT
+static int dhcp_start_ntpclient(FAR const struct dhcpc_state *ds)
+{
+  char ntp_server_list[CONFIG_NETUTILS_DHCPC_NTP_SERVER_NUM *
+                       (INET_ADDRSTRLEN + 1)];
+  size_t offset = 0;
+  uint8_t i;
+
+  if (ds->num_ntpaddr == 0)
+    {
+      return ntpc_start();
+    }
+
+  ntp_server_list[0] = '\0';
+
+  for (i = 0; i < ds->num_ntpaddr; i++)
+    {
+      char addrbuf[INET_ADDRSTRLEN];
+      int ret;
+
+      if (ds->ntpaddr[i].s_addr == 0)
+        {
+          continue;
+        }
+
+      if (inet_ntop(AF_INET, &ds->ntpaddr[i], addrbuf, sizeof(addrbuf)) ==
+          NULL)
+        {
+          nerr("ERROR: failed to format DHCP NTP server %u\n", i);
+          return -EINVAL;
+        }
+
+      ret = snprintf(ntp_server_list + offset,
+                     sizeof(ntp_server_list) - offset,
+                     "%s%s", offset == 0 ? "" : ";", addrbuf);
+      if (ret < 0 || (size_t)ret >= sizeof(ntp_server_list) - offset)
+        {
+          nerr("ERROR: DHCP NTP server list is too long\n");
+          return -E2BIG;
+        }
+
+      offset += (size_t)ret;
+    }
+
+  if (offset == 0)
+    {
+      return ntpc_start();
+    }
+
+  ninfo("Starting NTP client from DHCP option 42: %s\n", ntp_server_list);
+  return ntpc_start_with_list(ntp_server_list);
+}
+#endif
+
 /****************************************************************************
  * Name: dhcp_obtain_statefuladdr
  *
@@ -140,6 +202,8 @@ static int dhcp_obtain_statefuladdr(FAR const char *ifname)
 
   /* Set up the DHCPC modules */
 
+  ninfo("Starting DHCP bringup on %s\n", ifname);
+
   handle = dhcpc_open(ifname, &mac, IFHWADDRLEN);
   if (handle == NULL)
     {
@@ -155,11 +219,32 @@ static int dhcp_obtain_statefuladdr(FAR const char *ifname)
   ret = dhcpc_request(handle, &ds);
   if (ret == OK)
     {
+      ninfo("DHCP result %s ip=%08" PRIx32 " mask=%08" PRIx32
+            " router=%08" PRIx32 " dns=%u ntp=%u\n",
+            ifname,
+            (uint32_t)ntohl(ds.ipaddr.s_addr),
+            (uint32_t)ntohl(ds.netmask.s_addr),
+            (uint32_t)ntohl(ds.default_router.s_addr),
+            ds.num_dnsaddr, ds.num_ntpaddr);
       ret = dhcp_setup_result(ifname, &ds);
+#ifdef CONFIG_NETUTILS_NTPCLIENT
+      if (ret == OK)
+        {
+          ret = dhcp_start_ntpclient(&ds);
+          if (ret < 0)
+            {
+              nerr("ERROR: failed to start NTP client from DHCP: %d\n", ret);
+            }
+          else
+            {
+              ret = OK;
+            }
+        }
+#endif
     }
   else
     {
-      nerr("ERROR: dhcpc request failed: %d\n", ret);
+      nerr("ERROR: dhcpc request failed on %s: %d\n", ifname, ret);
     }
 
   dhcpc_close(handle);

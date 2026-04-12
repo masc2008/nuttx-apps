@@ -34,6 +34,8 @@
 #include <errno.h>
 #include <limits.h>
 #include <fixedmath.h>
+#include <spawn.h>
+#include <sys/wait.h>
 
 #include <nuttx/net/ip.h>
 
@@ -121,8 +123,6 @@ static void ping_result(FAR const struct ping_result_s *result)
   switch (result->code)
     {
       case ICMP_E_HOSTIP:
-        fprintf(stderr, "ERROR: ping_gethostip(%s) failed\n",
-                result->info->hostname);
         break;
 
       case ICMP_E_MEMORY:
@@ -279,6 +279,60 @@ static void ping_result(FAR const struct ping_result_s *result)
     }
 }
 
+#if defined(CONFIG_SYSTEM_PING6) && defined(CONFIG_LIBC_EXECFUNCS)
+/****************************************************************************
+ * Name: ping6_fallback
+ ****************************************************************************/
+
+static int ping6_fallback(int argc, FAR char *argv[])
+{
+  FAR char **child_argv;
+  pid_t pid;
+  int ret;
+  int status;
+  int i;
+
+  child_argv = malloc(sizeof(FAR char *) * (argc + 1));
+  if (child_argv == NULL)
+    {
+      fprintf(stderr, "ERROR: Failed to allocate fallback argv\n");
+      return EXIT_FAILURE;
+    }
+
+  child_argv[0] = CONFIG_SYSTEM_PING6_PROGNAME;
+  for (i = 1; i < argc; i++)
+    {
+      child_argv[i] = argv[i];
+    }
+
+  child_argv[argc] = NULL;
+
+  ret = posix_spawnp(&pid, CONFIG_SYSTEM_PING6_PROGNAME, NULL, NULL,
+                     child_argv, NULL);
+  free(child_argv);
+  if (ret != 0)
+    {
+      fprintf(stderr, "ERROR: posix_spawnp(%s) failed: %d\n",
+              CONFIG_SYSTEM_PING6_PROGNAME, ret);
+      return EXIT_FAILURE;
+    }
+
+  ret = waitpid(pid, &status, 0);
+  if (ret < 0)
+    {
+      fprintf(stderr, "ERROR: waitpid() failed: %d\n", errno);
+      return EXIT_FAILURE;
+    }
+
+  if (WIFEXITED(status))
+    {
+      return WEXITSTATUS(status);
+    }
+
+  return EXIT_FAILURE;
+}
+#endif
+
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
@@ -403,7 +457,20 @@ int main(int argc, FAR char *argv[])
 
   info.hostname = argv[optind];
   icmp_ping(&info);
-  return priv.code < 0 ? EXIT_FAILURE: EXIT_SUCCESS;
+
+#if defined(CONFIG_SYSTEM_PING6) && defined(CONFIG_LIBC_EXECFUNCS)
+  if (priv.code == ICMP_E_HOSTIP)
+    {
+      return ping6_fallback(argc, argv);
+    }
+#endif
+
+  if (priv.code == ICMP_E_HOSTIP)
+    {
+      fprintf(stderr, "ERROR: ping_gethostip(%s) failed\n", info.hostname);
+    }
+
+  return priv.code < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 
 errout_with_usage:
   optind = 0;
